@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+# update-antigravity -- Update Antigravity Desktop to the latest release.
+# https://github.com/<your-username>/update-antigravity
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+readonly INSTALL_DIR="$HOME/.local/share/Antigravity-x64"
+readonly DOWNLOAD_PAGE="https://antigravity.google/download"
+readonly BINARY_NAME="antigravity"
+readonly SCRIPT_VERSION="2.2.0"
+# Tracks the last version installed by this script (not the Electron version file).
+readonly VERSION_MARKER="$HOME/.local/share/Antigravity-x64/.installed-version"
+
+# ---------------------------------------------------------------------------
+# Terminal helpers
+# ---------------------------------------------------------------------------
+_has_color() {
+  [[ -t 1 ]] && command -v tput >/dev/null 2>&1 \
+    && tput colors >/dev/null 2>&1 \
+    && [[ "$(tput colors)" -ge 8 ]]
+}
+
+if _has_color; then
+  BOLD="$(tput bold)"
+  DIM="$(tput dim 2>/dev/null || tput setaf 8 2>/dev/null || printf '')"
+  RED="$(tput setaf 1)"
+  GRN="$(tput setaf 2)"
+  YLW="$(tput setaf 3)"
+  CYN="$(tput setaf 6)"
+  RST="$(tput sgr0)"
+  COLS="$(tput cols 2>/dev/null || printf '80')"
+else
+  BOLD="" DIM="" RED="" GRN="" YLW="" CYN="" RST=""
+  COLS=80
+fi
+
+log()  { printf '%s\n'            "$*"; }
+info() { printf '%s==>%s %s\n'   "$CYN" "$RST" "$*"; }
+ok()   { printf '%s  ok%s %s\n'  "$GRN" "$RST" "$*"; }
+warn() { printf '%s warn%s %s\n' "$YLW" "$RST" "$*" >&2; }
+die()  { printf '%s  err%s %s\n' "$RED" "$RST" "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Cleanup on exit or interrupt
+# ---------------------------------------------------------------------------
+_TMPDIR=""
+_cleanup() {
+  local code=$?
+  # Kill the spinner if it is still running.
+  [[ -n "${_SPINNER_PID:-}" ]] && kill "$_SPINNER_PID" 2>/dev/null || true
+  [[ -n "$_TMPDIR" && -d "$_TMPDIR" ]] && rm -rf "$_TMPDIR"
+  exit "$code"
+}
+trap _cleanup EXIT
+trap 'printf "\nAborted.\n" >&2; exit 130' INT TERM
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<EOF
+${BOLD}update-antigravity${RST} ${DIM}v${SCRIPT_VERSION}${RST}
+
+Download and install the latest Antigravity Desktop for Linux x64.
+
+${BOLD}Usage${RST}
+  update-antigravity [options]
+
+${BOLD}Options${RST}
+  -n, --dry-run     Show what would happen without making changes
+  -y, --yes         Skip all confirmation prompts
+      --no-launch   Do not offer to relaunch after update
+  -h, --help        Show this help
+
+${BOLD}Install directory${RST}
+  $INSTALL_DIR
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+DRY_RUN=false
+AUTO_YES=false
+NO_LAUNCH=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run)   DRY_RUN=true ;;
+    -y|--yes)       AUTO_YES=true ;;
+       --no-launch) NO_LAUNCH=true ;;
+    -h|--help)      usage; exit 0 ;;
+    *) die "Unknown option: $1. Run with --help for usage." ;;
+  esac
+  shift
+done
+
+# ---------------------------------------------------------------------------
+# Dependency check
+# ---------------------------------------------------------------------------
+_require() {
+  command -v "$1" >/dev/null 2>&1 || die "'$1' not found. Install it and try again."
+}
+_require curl
+_require tar
+_require pgrep
+_require od
+
+# ---------------------------------------------------------------------------
+# Spinner (draws a single animated line; call _spinner_stop to erase it)
+# ---------------------------------------------------------------------------
+_SPINNER_PID=""
+
+_spinner_start() {
+  # Only animate on a real terminal.
+  [[ -t 1 ]] || return 0
+  local label="${1:-Working...}"
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  (
+    local i=0
+    while true; do
+      printf '\r%s%s%s %s' "$CYN" "${frames[$i]}" "$RST" "$label"
+      i=$(( (i + 1) % ${#frames[@]} ))
+      sleep 0.08
+    done
+  ) &
+  _SPINNER_PID=$!
+}
+
+_spinner_stop() {
+  [[ -z "${_SPINNER_PID:-}" ]] && return 0
+  kill "$_SPINNER_PID" 2>/dev/null || true
+  wait "$_SPINNER_PID" 2>/dev/null || true
+  _SPINNER_PID=""
+  # Erase the spinner line.
+  [[ -t 1 ]] && printf '\r\033[K'
+}
+
+# ---------------------------------------------------------------------------
+# Progress bar for downloads
+# Draws a fixed-width bar that updates in place using \r.
+# Reads curl's --write-out output written to a temp file.
+# ---------------------------------------------------------------------------
+_progress_bar() {
+  local archive="$1"
+  local url="$2"
+  local stats_file="$3"
+
+  # Bar width: terminal width minus label columns (12 for prefix + %) or 40 min.
+  local bar_width=$(( COLS - 20 ))
+  (( bar_width < 20 )) && bar_width=20
+
+  local downloaded=0 total=0 pct=0 prev_pct=-1
+  local filled bar_str speed_str
+
+  while true; do
+    # curl writes "downloaded_bytes total_bytes speed" to stats_file each second.
+    if [[ -s "$stats_file" ]]; then
+      read -r downloaded total speed_str < "$stats_file" 2>/dev/null || true
+    fi
+
+    if (( total > 0 )); then
+      pct=$(( downloaded * 100 / total ))
+    else
+      pct=0
+    fi
+
+    if (( pct != prev_pct )); then
+      filled=$(( pct * bar_width / 100 ))
+      bar_str="$(printf '%0.s█' $(seq 1 "$filled") 2>/dev/null)$(printf '%0.s░' $(seq 1 $(( bar_width - filled )) ) 2>/dev/null)"
+      printf '\r  %s%s%s %3d%%' "$GRN" "$bar_str" "$RST" "$pct"
+      prev_pct=$pct
+    fi
+
+    # Stop once curl is done (stats_file contains 100 or the archive exists and is non-growing).
+    (( pct >= 100 )) && break
+    [[ ! -e "$archive" ]] && { sleep 0.2; continue; }
+    sleep 0.2
+  done
+
+  # Complete bar.
+  bar_str="$(printf '%0.s█' $(seq 1 "$bar_width") 2>/dev/null)"
+  printf '\r  %s%s%s 100%%\n' "$GRN" "$bar_str" "$RST"
+}
+
+# ---------------------------------------------------------------------------
+# Read the currently installed version
+# ---------------------------------------------------------------------------
+_installed_version() {
+  # Prefer the marker written by this script after a successful install.
+  # The file `$INSTALL_DIR/version` contains the Electron version, not the app version.
+  if [[ -f "$VERSION_MARKER" ]]; then
+    cat "$VERSION_MARKER"
+    return
+  fi
+
+  # First run: no marker yet. Report "not installed" so the user gets an update.
+  if [[ ! -x "$INSTALL_DIR/$BINARY_NAME" ]]; then
+    printf 'not installed'
+    return
+  fi
+
+  printf 'unknown'
+}
+
+_save_version_marker() {
+  printf '%s' "$1" > "$VERSION_MARKER"
+}
+
+# ---------------------------------------------------------------------------
+# Fetch the download URL from the official page
+# ---------------------------------------------------------------------------
+_fetch_url() {
+  curl -sL --compressed --max-time 30 "$DOWNLOAD_PAGE" \
+    | grep -oE 'https://storage\.googleapis\.com/antigravity-public/antigravity-hub/[^"'\'' ]+/linux-x64/Antigravity\.tar\.gz' \
+    | head -n1
+}
+
+_version_from_url() {
+  printf '%s' "$1" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?' | head -n1
+}
+
+# ---------------------------------------------------------------------------
+# Find the main Antigravity process (not child workers)
+# ---------------------------------------------------------------------------
+_find_main_pid() {
+  # Look for the exact binary path as the executable, not just in argv.
+  # This avoids picking up helper/renderer subprocesses.
+  local binary="$INSTALL_DIR/$BINARY_NAME"
+  local pid
+
+  # readlink /proc/<pid>/exe matches the real binary; much more precise than pgrep -f.
+  while IFS= read -r pid; do
+    local exe
+    exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)" || continue
+    [[ "$exe" == "$binary" ]] && printf '%s' "$pid" && return
+  done < <(pgrep -x "$BINARY_NAME" 2>/dev/null || true)
+
+  # Fallback: find the topmost matching process (lowest PID = parent).
+  pgrep -f "$binary" 2>/dev/null | sort -n | head -n1 || true
+}
+
+# ---------------------------------------------------------------------------
+# Launch Antigravity detached from this terminal session
+# ---------------------------------------------------------------------------
+_launch_detached() {
+  local binary="$INSTALL_DIR/$BINARY_NAME"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$binary" >/dev/null 2>&1 &
+  else
+    nohup "$binary" >/dev/null 2>&1 &
+  fi
+  disown 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+  log ""
+  log "${BOLD}Antigravity Desktop Updater${RST}"
+  log "${DIM}─────────────────────────────────${RST}"
+
+  # 1. Installed version
+  local installed
+  installed="$(_installed_version)"
+  info "Installed version: ${BOLD}${installed}${RST}"
+
+  # 2. Fetch latest URL
+  _spinner_start "Checking for updates..."
+  local url
+  url="$(_fetch_url)"
+  _spinner_stop
+
+  if [[ -z "$url" ]]; then
+    die "Could not find a download URL on $DOWNLOAD_PAGE. Check your internet connection or visit the page manually."
+  fi
+
+  local latest
+  latest="$(_version_from_url "$url")"
+  info "Latest version:    ${BOLD}${latest:-unknown}${RST}"
+
+  # 3. Skip if already up to date
+  if [[ "$installed" != "not installed" && "$installed" != "unknown" && \
+        "${latest:-}"  != "unknown"       && "$installed" == "$latest" ]]; then
+    ok "Already up to date. Nothing to do."
+    exit 0
+  fi
+
+  # 4. Dry-run
+  if $DRY_RUN; then
+    log ""
+    log "${YLW}Dry run. No changes will be made.${RST}"
+    log "Would download: $url"
+    log "Would install into: $INSTALL_DIR"
+    exit 0
+  fi
+
+  # 5. Stop the running app if needed
+  local main_pid
+  main_pid="$(_find_main_pid)"
+  if [[ -n "$main_pid" ]]; then
+    warn "Antigravity Desktop is running (PID: $main_pid)."
+    if $AUTO_YES; then
+      info "Stopping Antigravity Desktop..."
+    else
+      printf '%s  ?  %s Stop Antigravity Desktop and continue? [y/N] ' "$YLW" "$RST"
+      read -r reply
+      [[ "$reply" =~ ^[Yy]$ ]] || {
+        log "Aborted. Close Antigravity Desktop first, then run again."
+        exit 0
+      }
+    fi
+    # Kill the whole process group rooted at the main PID.
+    kill -- "-$(ps -o pgid= -p "$main_pid" 2>/dev/null | tr -d ' ')" 2>/dev/null \
+      || kill "$main_pid" 2>/dev/null \
+      || pkill -f "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null \
+      || true
+    sleep 2
+  fi
+
+  # 6. Download with a progress bar
+  _TMPDIR="$(mktemp -d)"
+  local archive="$_TMPDIR/Antigravity.tar.gz"
+  local stats_file="$_TMPDIR/curl_stats"
+
+  info "Downloading ${latest:-latest}..."
+  log ""
+
+  # Run curl in the background; write transfer stats every 0.5 s to stats_file.
+  # -w writes one line after the transfer completes; -# and --progress-bar are skipped
+  # in favour of our own renderer so the bar stays on one line.
+  curl -sL --max-time 300 \
+    -o "$archive" \
+    --write-out "%{size_download} %{size_header} %{speed_download}\n" \
+    "$url" >"$stats_file" 2>/dev/null &
+  local curl_pid=$!
+
+  # Feed the progress bar while curl runs.
+  if [[ -t 1 ]]; then
+    # Poll the incomplete archive size against the Content-Length.
+    # Grab Content-Length with a HEAD request (best-effort; skip on failure).
+    local total_bytes
+    total_bytes="$(curl -sI --max-time 10 "$url" 2>/dev/null \
+      | grep -i '^content-length:' \
+      | tail -n1 \
+      | grep -oE '[0-9]+' || printf '0')"
+
+    local bar_width=$(( COLS - 20 ))
+    (( bar_width < 20 )) && bar_width=20
+
+    local prev_pct=-1
+    while kill -0 "$curl_pid" 2>/dev/null; do
+      local downloaded_bytes=0
+      [[ -f "$archive" ]] && downloaded_bytes="$(stat -c%s "$archive" 2>/dev/null || printf '0')"
+
+      local pct=0
+      if (( total_bytes > 0 )); then
+        pct=$(( downloaded_bytes * 100 / total_bytes ))
+        (( pct > 100 )) && pct=100
+      fi
+
+      if (( pct != prev_pct )); then
+        local filled=$(( pct * bar_width / 100 ))
+        local empty=$(( bar_width - filled ))
+        local bar_fill bar_empty
+        bar_fill="$(printf '█%.0s' $(seq 1 "$filled") 2>/dev/null || printf '')"
+        bar_empty="$(printf '░%.0s' $(seq 1 "$empty")  2>/dev/null || printf '')"
+        printf '\r  %s%s%s%s %3d%%' "$GRN" "$bar_fill" "$DIM" "$bar_empty$RST" "$pct"
+        prev_pct=$pct
+      fi
+      sleep 0.3
+    done
+
+    # Complete bar.
+    local bar_full
+    bar_full="$(printf '█%.0s' $(seq 1 "$bar_width") 2>/dev/null || printf '')"
+    printf '\r  %s%s%s 100%%\n' "$GRN" "$bar_full" "$RST"
+  fi
+
+  wait "$curl_pid" || die "Download failed. Check your connection and try again."
+  log ""
+
+  # 7. Integrity check
+  local magic
+  magic="$(od -An -N2 -tx1 "$archive" 2>/dev/null | tr -d ' \n')" || true
+  [[ "$magic" == "1f8b" ]] \
+    || die "Downloaded file is not a valid gzip archive. The release may still be publishing; try again in a moment."
+
+  # 8. Extract
+  info "Installing into $INSTALL_DIR..."
+  mkdir -p "$HOME/.local/share"
+  tar -xzf "$archive" -C "$HOME/.local/share/"
+  chmod +x "$INSTALL_DIR/$BINARY_NAME"
+
+  # 9. Save version marker and report
+  _save_version_marker "${latest:-unknown}"
+  log ""
+  ok "Updated to ${BOLD}${latest:-unknown}${RST}."
+  log ""
+
+  # 10. Offer to relaunch (detached from this terminal)
+  if ! $NO_LAUNCH; then
+    if $AUTO_YES; then
+      info "Launching Antigravity Desktop..."
+      _launch_detached
+      ok "Antigravity Desktop started. You can close this terminal."
+    else
+      printf '%s  ?  %s Launch Antigravity Desktop now? [Y/n] ' "$YLW" "$RST"
+      read -r reply
+      if [[ -z "$reply" || "$reply" =~ ^[Yy]$ ]]; then
+        info "Launching Antigravity Desktop..."
+        _launch_detached
+        ok "Antigravity Desktop started. You can close this terminal."
+      else
+        log "Run ${BOLD}antigravity${RST} to open the app when you are ready."
+      fi
+    fi
+  fi
+
+  log ""
+}
+
+main
